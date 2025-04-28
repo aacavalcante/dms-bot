@@ -1,7 +1,11 @@
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+dsm_oauth.json
+get_token.py
 
 # C extensions
 *.so
@@ -150,6 +154,7 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+dsm_oauth.json/
 
 # Pyre type checker
 .pyre/
