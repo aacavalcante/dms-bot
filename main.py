@@ -120,7 +120,7 @@ async def store_viagem(session_id: int, detalhes: Dict[str, str]):
 # -----------------------------------------------------------------------------
 sessions: Dict[str, Dict[str, Any]] = {}
 
-def branch(nome):
+def branch(nome: str) -> str:
     return (
         f"Olá {nome}, como posso te ajudar?\n"
         "1️⃣  Quer um orçamento?\n"
@@ -128,10 +128,10 @@ def branch(nome):
         "3️⃣  Gostaria de tirar uma dúvida?"
     )
 
-def roteiro_q1():
+def roteiro_q1() -> str:
     return "Você já tem uma viagem em mente?\n1️⃣  Sim\n2️⃣  Não"
 
-def roteiro_q_det():
+def roteiro_q_det() -> str:
     return (
         "Legal! Em que estágio você está?\n"
         "1️⃣ Sei lugar e data\n"
@@ -140,28 +140,37 @@ def roteiro_q_det():
         "4️⃣ Não pensei ainda"
     )
 
-def roteiro_q_exemplo(opt: str):
+def roteiro_q_exemplo(opt: str) -> str:
     if opt == "1":
         return (
             "Ótimo! Envie no formato:\n"
-            "*Destino*: Paris\n*Datas*: 12/09/2025 a 20/09/2025"
+            "Destino / Período. Ex: Paris / julho 2024"
         )
     if opt == "2":
         return (
-            "Beleza! Envie no formato:\n"
-            "*Destino*: Paris\n*Datas*: flexível"
+            "Beleza! Envie apenas o destino. Ex: Paris"
         )
     if opt == "3":
         return (
-            "Certo! Envie no formato:\n"
-            "*Destino*: flexível\n*Datas*: 12/09/2025 a 20/09/2025"
+            "Certo! Envie apenas o período. Ex: 12/09/2025 a 20/09/2025"
         )
     return "Conte-me como posso ajudar:"
 
-def roteiro_q_agenda():
+def roteiro_q_agenda() -> str:
     return "Você gostaria de marcar uma reunião com nosso time?\n1️⃣  Sim\n2️⃣  Não"
 
 email_re = re.compile(r"^[\w\.-]+@[\w\.-]+\.[A-Za-z]{2,}$")
+
+# -----------------------------------------------------------------------------
+# Helper para formatar datas em DD-MM-YYYY
+# -----------------------------------------------------------------------------
+def format_date_br(s: str) -> str:
+    try:
+        # tenta interpretar ISO (YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS)
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return s
 
 # -----------------------------------------------------------------------------
 # OpenAI parser para detalhes da viagem
@@ -203,7 +212,7 @@ async def parse_viagem(texto: str) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # WhatsApp helpers
 # -----------------------------------------------------------------------------
-async def wpp(dest, body):
+async def wpp(dest: str, body: str):
     await httpx.AsyncClient().post(
         WHATSAPP_API_URL,
         headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
@@ -216,7 +225,7 @@ async def wpp(dest, body):
         timeout=10,
     )
 
-async def wpp_doc(dest, path, caption="Apresentação DSM"):
+async def wpp_doc(dest: str, path: str, caption: str = "Apresentação DSM"):
     mime = mimetypes.guess_type(path)[0] or "application/pdf"
     up = await httpx.AsyncClient().post(
         f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/media",
@@ -265,7 +274,7 @@ def free_slots() -> List[Dict[str, str]]:
     ]
     allowed = ["09:00", "10:00", "13:00", "14:00", "16:00", "17:00"]
     dur = timedelta(hours=1)
-    slots = []
+    slots: List[Dict[str, str]] = []
     for i in range(14):
         d = now + timedelta(days=i)
         if d.weekday() not in (1, 3):
@@ -275,18 +284,27 @@ def free_slots() -> List[Dict[str, str]]:
             hr, mn = map(int, h.split(":"))
             start = d.replace(hour=hr, minute=mn, second=0, microsecond=0)
             end = start + dur
+            # pular horários que já passaram
+            if start < now:
+                continue
             if any(start < b_end and end > b_start for b_start, b_end in day_busy):
                 continue
-            slots.append({"id": len(slots) + 1, "data": start.strftime("%Y-%m-%d"), "hora": h})
+            # armazenar já em formato brasileiro
+            slots.append({
+                "id": len(slots) + 1,
+                "data": start.strftime("%d-%m-%Y"),
+                "hora": h
+            })
     return slots
 
 def create_event(data: Dict[str, str], slot: Dict[str, str]) -> str:
     svc = gservice()
     ev = {
         "summary": f"Reunião DSM – {data['nome']}",
-        "start": {"dateTime": f"{slot['data']}T{slot['hora']}:00", "timeZone": "America/Sao_Paulo"},
+        "start": {"dateTime": f"{slot['data'][6:10]}-{slot['data'][3:5]}-{slot['data'][0:2]}T{slot['hora']}:00", "timeZone": "America/Sao_Paulo"},
         "end": {
-            "dateTime": f"{slot['data']}T{int(slot['hora'][:2]) + 1:02d}:{slot['hora'][3:]}:00",
+            # reconstrói ISO para envio ao Google
+            "dateTime": f"{slot['data'][6:10]}-{slot['data'][3:5]}-{slot['data'][0:2]}T{int(slot['hora'][:2]) + 1:02d}:{slot['hora'][3:]}:00",
             "timeZone": "America/Sao_Paulo",
         },
         "attendees": [{"email": data["email"]}],
@@ -301,27 +319,21 @@ def create_event(data: Dict[str, str], slot: Dict[str, str]) -> str:
     )
 
 # -----------------------------------------------------------------------------
-# AGENDA FLOW (inalterado)
+# AGENDA FLOW (inalterado exceto formatação de data e mensagem final)
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# AGENDA FLOW (ajuste para redirecionar ao atendente humano no “Não”)
-# -----------------------------------------------------------------------------
-async def agenda_flow(dest, msg):
+async def agenda_flow(dest: str, msg: str):
     s = sessions[dest]
 
     # Pergunta de agendamento
     if s["phase"] == "agenda_pending":
         if msg.strip() == "1":
-            # segue fluxo normal de coleta de e-mail
             s["phase"] = "agenda_email"
             await wpp(dest, "Perfeito! Qual é o seu e-mail?")
             return
-
         elif msg.strip() == "2":
             # REDIRECIONA para atendimento humano
             await atendente_flow(dest)
             return
-
         else:
             await wpp(dest, "Responda 1 ou 2.")
             return
@@ -336,7 +348,6 @@ async def agenda_flow(dest, msg):
         slots = free_slots()
         if not slots:
             await wpp(dest, "Sem horários agora. Tente depois.")
-            # se não há slots, também vamos para o humano
             await atendente_flow(dest)
             return
         s.update({"phase": "agenda_choice", "slots": slots})
@@ -360,42 +371,37 @@ async def agenda_flow(dest, msg):
         link = create_event(s["data"], sl)
         await wpp(
             dest,
-            f"✅ Reunião marcada!\n📅 {sl['data']} ⏰ {sl['hora']}\n🔗 Meet: {link}\n\nAté breve! ✈️",
+            f"✅ Reunião marcada!\n📅 {sl['data']} às {sl['hora']}\n\n"
+            f"🔗 Meet: {link}\n\n"
+            "Nosso encontro foi agendado com sucesso. Até breve!"
         )
         if (sid := s.get("db_session_id")):
             await store_viagem(sid, s["data"].get("viagem", {}))
         del sessions[dest]
         return
 
-
 # -----------------------------------------------------------------------------
-# DSM FLOW (nova etapa 2)
+# DSM FLOW (nova etapa 2, inalterado)
 # -----------------------------------------------------------------------------
-async def dsm_flow(dest, msg):
+async def dsm_flow(dest: str, msg: str):
     await wpp_doc(dest, PDF_LOCAL_PATH)
+    # nova mensagem antes do agendamento
+    await wpp(dest, "Sua viagem começa aqui.")
     s = sessions[dest]
     s["phase"] = "agenda_pending"
     await wpp(dest, roteiro_q_agenda())
 
 # -----------------------------------------------------------------------------
-# ATENDENTE FLOW (nova etapa 3)
+# ATENDENTE FLOW (ajuste de mensagem final)
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# ATENDENTE FLOW (nova etapa 3)
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# ATENDENTE FLOW (etapa 3, ajustado)
-# -----------------------------------------------------------------------------
-async def atendente_flow(dest):
-    # 1) avisa o usuário sobre o atendente humano
+async def atendente_flow(dest: str):
     texto = (
         "👍 Um de nossos consultores humanos irá te atender.\n\n"
         f"Para falar agora, envie sua dúvida para: *{HUMAN_NUMBER}* no WhatsApp.\n"
-        "Se preferir, aguarde que entraremos em contato por aqui em breve."
+        "Se preferir, é só aguardar que entraremos em contato com você"
     )
     await wpp(dest, texto)
 
-    # 2) envia alerta para o atendente DE FORMA EXPLÍCITA
     alert = (
         f"🚨 *Atendimento solicitado* 🚨\n"
         f"Usuário: {dest}\n"
@@ -412,15 +418,12 @@ async def atendente_flow(dest):
         },
         timeout=10,
     )
-
-    # 3) encerra a sessão automatizada
     sessions.pop(dest, None)
-
 
 # -----------------------------------------------------------------------------
 # CHAT (OpenAI) – igual
 # -----------------------------------------------------------------------------
-async def chat_flow(dest, msg):
+async def chat_flow(dest: str, msg: str):
     s = sessions[dest]
     s.setdefault("hist", "")
     s["hist"] += f"Usuário: {msg}\n"
@@ -443,9 +446,9 @@ async def chat_flow(dest, msg):
     s["hist"] += f"Bot: {ans}\n"
 
 # -----------------------------------------------------------------------------
-# ROTEIRO FLOW – com novos estados coleta & confirmação (inalterado)
+# ROTEIRO FLOW – com formatação de data no resumo
 # -----------------------------------------------------------------------------
-async def roteiro_flow(dest, msg):
+async def roteiro_flow(dest: str, msg: str):
     s = sessions[dest]
     st = s.get("state", "viagem")
     ch = msg.strip()
@@ -480,9 +483,15 @@ async def roteiro_flow(dest, msg):
         s["data"]["raw_descricao"] = msg.strip()
         parsed = await parse_viagem(msg.strip())
         s["data"]["viagem"] = parsed
+        # formatar datas para BR
+        destino = parsed["destino"] or "flexível"
+        inicio = parsed["data_inicio"] or ""
+        fim = parsed["data_fim"] or ""
+        inicio_fmt = format_date_br(inicio) if inicio else "flexível"
+        fim_fmt    = format_date_br(fim)    if fim    else "flexível"
         resumo = (
-            f"Destino: {parsed['destino'] or 'flexível'}\n"
-            f"Datas : {parsed['data_inicio'] or 'flexível'} até {parsed['data_fim'] or 'flexível'}\n"
+            f"Destino: {destino}\n"
+            f"Período: {inicio_fmt} até {fim_fmt}\n"
             "Essas informações estão corretas?\n1️⃣ Sim\n2️⃣ Não"
         )
         s["state"] = "coleta_confirm"
@@ -516,9 +525,9 @@ async def roteiro_flow(dest, msg):
         return
 
 # -----------------------------------------------------------------------------
-# DISPATCHER (tecla 0 reinicia; cria ConversationSession para banco)
+# DISPATCHER (menu 1,2,3 validado corretamente)
 # -----------------------------------------------------------------------------
-async def handle_text(dest, msg):
+async def handle_text(dest: str, msg: str):
     if msg.strip() == "0" and dest in sessions:
         del sessions[dest]
 
@@ -537,7 +546,7 @@ async def handle_text(dest, msg):
 
     if s["phase"] == "branch":
         if msg.strip() not in {"1", "2", "3"}:
-            await wpp(dest, "Escolha 1-3.")
+            await wpp(dest, "Escolha 1, 2 ou 3")
             return
 
         choice = msg.strip()
@@ -546,7 +555,7 @@ async def handle_text(dest, msg):
             s["state"] = "viagem"
         elif choice == "2":
             s["bot"] = "dsm"
-        else:  # opção 3
+        else:
             s["bot"] = "atendente"
 
         s["phase"] = "flow"
@@ -572,7 +581,7 @@ async def handle_text(dest, msg):
             await wpp(dest, "Sobre o que você quer conversar?")
         return
 
-    # continuidade dentro dos fluxos já iniciados
+    # continua o fluxo já iniciado
     if s.get("bot") == "roteiro":
         await roteiro_flow(dest, msg)
     elif s.get("bot") == "dsm":
@@ -609,7 +618,7 @@ async def process_audio(msg, dest):
     await handle_text(dest, txt)
 
 # -----------------------------------------------------------------------------
-# Webhook Pydantic & endpoints (certifique-se de que ValuePayload inclui messages)
+# Webhook Pydantic & endpoints
 # -----------------------------------------------------------------------------
 class TextPayload(BaseModel):
     body: str
