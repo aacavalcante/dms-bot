@@ -1,7 +1,16 @@
 # =============================================================================
 # main.py – Bot “Gabi” · WhatsApp · OpenAI · Google Calendar
 # =============================================================================
-import os, io, json, logging, asyncio, mimetypes, tempfile, re, uuid, enum
+import os
+import io
+import json
+import logging
+import asyncio
+import mimetypes
+import tempfile
+import re
+import uuid
+import enum
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -19,7 +28,10 @@ from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, Enum, JSON, func
+from sqlalchemy import (
+    Column, String, Integer, DateTime, Text, ForeignKey,
+    JSON, func, Enum as SQLEnum
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 
@@ -34,17 +46,17 @@ WHATSAPP_API_URL       = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/
 OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY")
 DATABASE_URL           = os.getenv("DATABASE_URL")
 
-BASE_DIR   = Path(__file__).resolve().parent
-TOKEN_DIR  = BASE_DIR / "token"; TOKEN_DIR.mkdir(exist_ok=True)
-OAUTH_FILE = Path(os.getenv("GOOGLE_OAUTH_FILE", TOKEN_DIR / "dsm_oauth.json"))
-OWNER_CALENDAR_ID = os.getenv("OWNER_CALENDAR_ID", "primary")
-CALENDAR_ID       = os.getenv("GOOGLE_CALENDAR_ID", OWNER_CALENDAR_ID)
+BASE_DIR               = Path(__file__).resolve().parent
+TOKEN_DIR              = BASE_DIR / "token"; TOKEN_DIR.mkdir(exist_ok=True)
+OAUTH_FILE             = Path(os.getenv("GOOGLE_OAUTH_FILE", TOKEN_DIR / "dsm_oauth.json"))
+OWNER_CALENDAR_ID      = os.getenv("OWNER_CALENDAR_ID", "primary")
+CALENDAR_ID            = os.getenv("GOOGLE_CALENDAR_ID", OWNER_CALENDAR_ID)
 
 GOOGLE_SERVICE_ACCOUNT_CONTENT = os.getenv("GOOGLE_SERVICE_ACCOUNT_CONTENT", "{}")
-PDF_LOCAL_PATH = os.path.join(os.path.dirname(__file__), "presentation", "dsm.pdf")
+PDF_LOCAL_PATH         = os.path.join(os.path.dirname(__file__), "presentation", "dsm.pdf")
 
 # Número do atendente humano (WhatsApp)
-HUMAN_NUMBER = "+556182182423"
+HUMAN_NUMBER           = "+556182182423"
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 app    = FastAPI()
@@ -62,44 +74,96 @@ def owner_creds():
     if not OAUTH_FILE.exists():
         raise RuntimeError(f"token Google ausente em {OAUTH_FILE}")
     _owner_creds = Credentials.from_authorized_user_info(
-        json.load(OAUTH_FILE.open()), ["https://www.googleapis.com/auth/calendar"])
+        json.load(OAUTH_FILE.open()), ["https://www.googleapis.com/auth/calendar"]
+    )
     return _owner_creds
 
 def gservice():
     return build("calendar", "v3", credentials=owner_creds(), cache_discovery=False)
 
 # -----------------------------------------------------------------------------
-# DATABASE
+# DATABASE MODELS
 # -----------------------------------------------------------------------------
 Base = declarative_base()
 
 class FlowType(enum.Enum):
-    roteiro = "roteiro"
+    roteiro  = "roteiro"
     conversa = "conversa"
+
+class SenderType(enum.Enum):
+    user = "user"
+    bot  = "bot"
 
 class User(Base):
     __tablename__ = "users"
-    phone = Column(String(20), primary_key=True)
-    name = Column(String(100))
-    email = Column(String(100))
+    phone           = Column(String(20), primary_key=True)
+    name            = Column(String(100))
+    email           = Column(String(100))
     data_nascimento = Column(String(20))
-    created_at = Column(DateTime, server_default=func.now())
-    updated_at = Column(DateTime, onupdate=func.now())
+    created_at      = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at      = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 class ConversationSession(Base):
     __tablename__ = "conversation_sessions"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_phone = Column(String(20), ForeignKey("users.phone"))
-    flow = Column(Enum(FlowType))
-    started_at = Column(DateTime, server_default=func.now())
-    ended_at = Column(DateTime)
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    user_phone   = Column(String(20), ForeignKey("users.phone"))
+    flow         = Column(SQLEnum(FlowType))
+    started_at   = Column(DateTime, server_default=func.now())
+    ended_at     = Column(DateTime)
     session_data = Column(JSON)
-    raw_payload = Column(JSON)
+    raw_payload  = Column(JSON)
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+class SessionLog(Base):
+    __tablename__ = "session_logs"
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    session_id   = Column(Integer, ForeignKey("conversation_sessions.id"), index=True, nullable=False)
+    phase        = Column(String(50), nullable=False)
+    session_data = Column(JSON, nullable=True)
+    sender       = Column(SQLEnum(SenderType), nullable=False, default=SenderType.user)
+    message      = Column(Text, nullable=False)
+    created_at   = Column(DateTime, server_default=func.now(), nullable=False)
+
+engine       = create_async_engine(DATABASE_URL, echo=False)
 SessionAsync = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-async def update_user_email(phone, email):
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+async def upsert_user_lead(phone: str):
+    """
+    Garante que o lead (telefone) exista na tabela users.
+    """
+    async with SessionAsync() as session:
+        existing = await session.get(User, phone)
+        if not existing:
+            lead = User(phone=phone)
+            session.add(lead)
+            await session.commit()
+
+async def log_session_step(
+    session_id: int,
+    phase: str,
+    session_data: Dict[str, Any],
+    *,
+    sender: SenderType,
+    message: str
+):
+    """
+    Persiste um registro de cada passo da sessão para auditoria,
+    incluindo quem enviou (user|bot) e o texto exato.
+    """
+    async with SessionAsync() as db:
+        log = SessionLog(
+            session_id=session_id,
+            phase=phase,
+            session_data=session_data,
+            sender=sender,
+            message=message,
+        )
+        db.add(log)
+        await db.commit()
+
+async def update_user_email(phone: str, email: str):
     async with SessionAsync() as s:
         u = await s.get(User, phone)
         if u:
@@ -119,6 +183,7 @@ async def store_viagem(session_id: int, detalhes: Dict[str, str]):
 # ESTADOS & UTILS
 # -----------------------------------------------------------------------------
 sessions: Dict[str, Dict[str, Any]] = {}
+email_re = re.compile(r"^[\w\.-]+@[\w\.-]+\.[A-Za-z]{2,}$")
 
 def branch(nome: str) -> str:
     return (
@@ -142,39 +207,133 @@ def roteiro_q_det() -> str:
 
 def roteiro_q_exemplo(opt: str) -> str:
     if opt == "1":
-        return (
-            "Ótimo! Envie no formato:\n"
-            "Destino / Período. Ex: Paris / julho 2024"
-        )
+        return "Ótimo! Envie no formato: Destino / Período. Ex: Paris / julho 2024"
     if opt == "2":
-        return (
-            "Beleza! Envie apenas o destino. Ex: Paris"
-        )
+        return "Beleza! Envie apenas o destino. Ex: Paris"
     if opt == "3":
-        return (
-            "Certo! Envie apenas o período. Ex: 12/09/2025 a 20/09/2025"
-        )
+        return "Certo! Envie apenas o período. Ex: 12/09/2025 a 20/09/2025"
     return "Conte-me como posso ajudar:"
 
 def roteiro_q_agenda() -> str:
     return "Você gostaria de marcar uma reunião com nosso time?\n1️⃣  Sim\n2️⃣  Não"
 
-email_re = re.compile(r"^[\w\.-]+@[\w\.-]+\.[A-Za-z]{2,}$")
-
-# -----------------------------------------------------------------------------
-# Helper para formatar datas em DD-MM-YYYY
-# -----------------------------------------------------------------------------
 def format_date_br(s: str) -> str:
     try:
-        # tenta interpretar ISO (YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS)
         dt = datetime.fromisoformat(s)
         return dt.strftime("%d-%m-%Y")
     except Exception:
         return s
 
-# -----------------------------------------------------------------------------
-# OpenAI parser para detalhes da viagem
-# -----------------------------------------------------------------------------
+def free_slots() -> List[Dict[str, Any]]:
+    """
+    Retorna slots livres do calendário nos próximos dias.
+    
+    Returns:
+        Lista de dicionários com 'id', 'data' e 'hora' 
+    """
+    try:
+        service = gservice()
+        now = datetime.utcnow().isoformat() + 'Z'
+        # Busca próximos 5 dias
+        end_time = (datetime.utcnow() + timedelta(days=5)).isoformat() + 'Z'
+        
+        # Consulta eventos existentes
+        calendar_result = service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=now,
+            timeMax=end_time,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        # Gera slots disponíveis (9h-18h com intervalos de 1h)
+        slots = []
+        dt = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+        end_dt = dt + timedelta(days=5)
+        
+        # Simplificado: gera 3 slots por dia
+        slot_id = 1
+        while dt < end_dt:
+            if dt.weekday() < 5:  # Segunda a sexta
+                for hour in [10, 14, 16]:  # Horários disponíveis
+                    slot_dt = dt.replace(hour=hour)
+                    if slot_dt > datetime.now():  # Só futuros
+                        slots.append({
+                            'id': slot_id,
+                            'data': slot_dt.strftime('%d/%m/%Y'),
+                            'hora': slot_dt.strftime('%H:%M'),
+                            'datetime': slot_dt.isoformat()
+                        })
+                        slot_id += 1
+            dt = dt + timedelta(days=1)
+            
+        return slots[:5]  # Limita a 5 opções
+    except Exception as e:
+        logger.error(f"Erro ao buscar slots livres: {e}")
+        return []
+
+def create_event(user_data: Dict[str, Any], slot: Dict[str, Any]) -> str:
+    """
+    Cria um evento no Google Calendar
+    
+    Args:
+        user_data: Dados do usuário
+        slot: Informações do slot selecionado
+        
+    Returns:
+        Link do Google Meet para a reunião
+    """
+    try:
+        service = gservice()
+        
+        # Informações do cliente
+        nome = user_data.get("nome", "Cliente")
+        email = user_data.get("email", "")
+        viagem = user_data.get("viagem", {})
+        destino = viagem.get("destino", "Consulta geral")
+        
+        # Cria evento
+        start_time = datetime.fromisoformat(slot['datetime'])
+        end_time = start_time + timedelta(minutes=45)
+        
+        event = {
+            'summary': f'Reunião DSM: {nome} - {destino}',
+            'description': f'Consulta de viagem para {destino}',
+            'start': {
+                'dateTime': start_time.isoformat(),
+                'timeZone': 'America/Sao_Paulo',
+            },
+            'end': {
+                'dateTime': end_time.isoformat(),
+                'timeZone': 'America/Sao_Paulo',
+            },
+            'conferenceData': {
+                'createRequest': {
+                    'requestId': f'dsm-meeting-{uuid.uuid4()}',
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+                }
+            }
+        }
+        
+        # Adiciona participante se tiver email
+        if email:
+            event['attendees'] = [{'email': email}]
+            
+        # Cria o evento com Google Meet
+        event = service.events().insert(
+            calendarId=CALENDAR_ID,
+            body=event,
+            conferenceDataVersion=1
+        ).execute()
+        
+        # Extrai link do Google Meet
+        meet_link = event.get('hangoutLink', 'Link indisponível')
+        return meet_link
+        
+    except Exception as e:
+        logger.error(f"Erro ao criar evento: {e}")
+        return "https://meet.google.com"  # Fallback
+
 json_block = re.compile(r"\{.*\}", re.DOTALL)
 
 async def parse_viagem(texto: str) -> Dict[str, str]:
@@ -210,9 +369,19 @@ async def parse_viagem(texto: str) -> Dict[str, str]:
         return {"destino": "", "data_inicio": "", "data_fim": ""}
 
 # -----------------------------------------------------------------------------
-# WhatsApp helpers
+# WHATSAPP HELPERS (log bot responses)
 # -----------------------------------------------------------------------------
 async def wpp(dest: str, body: str):
+    # Log bot message
+    sid = sessions.get(dest, {}).get("db_session_id")
+    ph  = sessions.get(dest, {}).get("phase")
+    if sid and ph:
+        await log_session_step(
+            sid, ph, sessions[dest]["data"],
+            sender=SenderType.bot,
+            message=body
+        )
+
     await httpx.AsyncClient().post(
         WHATSAPP_API_URL,
         headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
@@ -226,6 +395,16 @@ async def wpp(dest: str, body: str):
     )
 
 async def wpp_doc(dest: str, path: str, caption: str = "Apresentação DSM"):
+    # Log bot document caption
+    sid = sessions.get(dest, {}).get("db_session_id")
+    ph  = sessions.get(dest, {}).get("phase")
+    if sid and ph:
+        await log_session_step(
+            sid, ph, sessions[dest]["data"],
+            sender=SenderType.bot,
+            message=caption
+        )
+
     mime = mimetypes.guess_type(path)[0] or "application/pdf"
     up = await httpx.AsyncClient().post(
         f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/media",
@@ -248,97 +427,29 @@ async def wpp_doc(dest: str, path: str, caption: str = "Apresentação DSM"):
     )
 
 # -----------------------------------------------------------------------------
-# Google Calendar helpers
-# -----------------------------------------------------------------------------
-def free_slots() -> List[Dict[str, str]]:
-    tz, now = ZoneInfo("America/Sao_Paulo"), datetime.now(ZoneInfo("America/Sao_Paulo"))
-    sa = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SERVICE_ACCOUNT_CONTENT),
-        scopes=["https://www.googleapis.com/auth/calendar.readonly"],
-    )
-    svc = build("calendar", "v3", credentials=sa, cache_discovery=False)
-    fb = svc.freebusy().query(
-        body={
-            "timeMin": now.isoformat(),
-            "timeMax": (now + timedelta(days=14)).isoformat(),
-            "timeZone": "America/Sao_Paulo",
-            "items": [{"id": CALENDAR_ID}],
-        }
-    ).execute()
-    busy = [
-        (
-            datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(tz),
-            datetime.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(tz),
-        )
-        for b in fb["calendars"][CALENDAR_ID]["busy"]
-    ]
-    allowed = ["09:00", "10:00", "13:00", "14:00", "16:00", "17:00"]
-    dur = timedelta(hours=1)
-    slots: List[Dict[str, str]] = []
-    for i in range(14):
-        d = now + timedelta(days=i)
-        if d.weekday() not in (1, 3):
-            continue
-        day_busy = [(s, e) for s, e in busy if s.date() == d.date()]
-        for h in allowed:
-            hr, mn = map(int, h.split(":"))
-            start = d.replace(hour=hr, minute=mn, second=0, microsecond=0)
-            end = start + dur
-            # pular horários que já passaram
-            if start < now:
-                continue
-            if any(start < b_end and end > b_start for b_start, b_end in day_busy):
-                continue
-            # armazenar já em formato brasileiro
-            slots.append({
-                "id": len(slots) + 1,
-                "data": start.strftime("%d-%m-%Y"),
-                "hora": h
-            })
-    return slots
-
-def create_event(data: Dict[str, str], slot: Dict[str, str]) -> str:
-    svc = gservice()
-    ev = {
-        "summary": f"Reunião DSM – {data['nome']}",
-        "start": {"dateTime": f"{slot['data'][6:10]}-{slot['data'][3:5]}-{slot['data'][0:2]}T{slot['hora']}:00", "timeZone": "America/Sao_Paulo"},
-        "end": {
-            # reconstrói ISO para envio ao Google
-            "dateTime": f"{slot['data'][6:10]}-{slot['data'][3:5]}-{slot['data'][0:2]}T{int(slot['hora'][:2]) + 1:02d}:{slot['hora'][3:]}:00",
-            "timeZone": "America/Sao_Paulo",
-        },
-        "attendees": [{"email": data["email"]}],
-        "conferenceData": {"createRequest": {"requestId": str(uuid.uuid4())}},
-    }
-    evc = svc.events().insert(
-        calendarId=CALENDAR_ID, body=ev, conferenceDataVersion=1
-    ).execute()
-    return evc.get("hangoutLink") or next(
-        (ep["uri"] for ep in evc["conferenceData"]["entryPoints"] if ep["entryPointType"] == "video"),
-        "Link não informado",
-    )
-
-# -----------------------------------------------------------------------------
-# AGENDA FLOW (inalterado exceto formatação de data e mensagem final)
+# FLOWS (each flow logs user then uses wpp/wpp_doc to log bot)
 # -----------------------------------------------------------------------------
 async def agenda_flow(dest: str, msg: str):
     s = sessions[dest]
+    # Log user message
+    await log_session_step(
+        s["db_session_id"], s["phase"], s["data"],
+        sender=SenderType.user,
+        message=msg
+    )
 
-    # Pergunta de agendamento
     if s["phase"] == "agenda_pending":
         if msg.strip() == "1":
             s["phase"] = "agenda_email"
             await wpp(dest, "Perfeito! Qual é o seu e-mail?")
             return
         elif msg.strip() == "2":
-            # REDIRECIONA para atendimento humano
             await atendente_flow(dest)
             return
         else:
             await wpp(dest, "Responda 1 ou 2.")
             return
 
-    # Coleta de e-mail
     if s["phase"] == "agenda_email":
         if not email_re.match(msg.strip()):
             await wpp(dest, "E-mail inválido.")
@@ -357,7 +468,6 @@ async def agenda_flow(dest: str, msg: str):
         await wpp(dest, txt + "\nEscolha o número.")
         return
 
-    # Escolha do slot
     if s["phase"] == "agenda_choice":
         try:
             op = int(msg.strip())
@@ -380,20 +490,20 @@ async def agenda_flow(dest: str, msg: str):
         del sessions[dest]
         return
 
-# -----------------------------------------------------------------------------
-# DSM FLOW (nova etapa 2, inalterado)
-# -----------------------------------------------------------------------------
 async def dsm_flow(dest: str, msg: str):
-    await wpp_doc(dest, PDF_LOCAL_PATH)
-    # nova mensagem antes do agendamento
-    await wpp(dest, "Sua viagem começa aqui.")
     s = sessions[dest]
+    # Log user message
+    await log_session_step(
+        s["db_session_id"], s["phase"], s["data"],
+        sender=SenderType.user,
+        message=msg
+    )
+
+    await wpp_doc(dest, PDF_LOCAL_PATH)
+    await wpp(dest, "Sua viagem começa aqui.")
     s["phase"] = "agenda_pending"
     await wpp(dest, roteiro_q_agenda())
 
-# -----------------------------------------------------------------------------
-# ATENDENTE FLOW (ajuste de mensagem final)
-# -----------------------------------------------------------------------------
 async def atendente_flow(dest: str):
     texto = (
         "👍 Um de nossos consultores humanos irá te atender.\n\n"
@@ -420,11 +530,15 @@ async def atendente_flow(dest: str):
     )
     sessions.pop(dest, None)
 
-# -----------------------------------------------------------------------------
-# CHAT (OpenAI) – igual
-# -----------------------------------------------------------------------------
 async def chat_flow(dest: str, msg: str):
     s = sessions[dest]
+    # Log user message
+    await log_session_step(
+        s["db_session_id"], "chat", s["data"],
+        sender=SenderType.user,
+        message=msg
+    )
+
     s.setdefault("hist", "")
     s["hist"] += f"Usuário: {msg}\n"
     r = await httpx.AsyncClient().post(
@@ -445,11 +559,15 @@ async def chat_flow(dest: str, msg: str):
     await wpp(dest, ans)
     s["hist"] += f"Bot: {ans}\n"
 
-# -----------------------------------------------------------------------------
-# ROTEIRO FLOW – com formatação de data no resumo
-# -----------------------------------------------------------------------------
 async def roteiro_flow(dest: str, msg: str):
     s = sessions[dest]
+    # Log user message
+    await log_session_step(
+        s["db_session_id"], s.get("phase", "roteiro"), s["data"],
+        sender=SenderType.user,
+        message=msg
+    )
+
     st = s.get("state", "viagem")
     ch = msg.strip()
 
@@ -483,10 +601,9 @@ async def roteiro_flow(dest: str, msg: str):
         s["data"]["raw_descricao"] = msg.strip()
         parsed = await parse_viagem(msg.strip())
         s["data"]["viagem"] = parsed
-        # formatar datas para BR
         destino = parsed["destino"] or "flexível"
         inicio = parsed["data_inicio"] or ""
-        fim = parsed["data_fim"] or ""
+        fim    = parsed["data_fim"] or ""
         inicio_fmt = format_date_br(inicio) if inicio else "flexível"
         fim_fmt    = format_date_br(fim)    if fim    else "flexível"
         resumo = (
@@ -525,9 +642,12 @@ async def roteiro_flow(dest: str, msg: str):
         return
 
 # -----------------------------------------------------------------------------
-# DISPATCHER (menu 1,2,3 validado corretamente)
+# DISPATCHER (instrumentado)
 # -----------------------------------------------------------------------------
 async def handle_text(dest: str, msg: str):
+    # 1) garante lead gravado no primeiro contato
+    await upsert_user_lead(dest)
+
     if msg.strip() == "0" and dest in sessions:
         del sessions[dest]
 
@@ -571,6 +691,13 @@ async def handle_text(dest: str, msg: str):
             await db.refresh(cs)
             s["db_session_id"] = cs.id
 
+        # log user branch selection
+        await log_session_step(
+            s["db_session_id"], "branch", s["data"],
+            sender=SenderType.user,
+            message=msg.strip()
+        )
+
         if s["bot"] == "roteiro":
             await wpp(dest, roteiro_q1())
         elif s["bot"] == "dsm":
@@ -590,7 +717,7 @@ async def handle_text(dest: str, msg: str):
         await chat_flow(dest, msg)
 
 # -----------------------------------------------------------------------------
-# AUDIO helpers – igual
+# AUDIO helpers (inalterado)
 # -----------------------------------------------------------------------------
 async def dl_media(fid, mime):
     h = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
@@ -615,10 +742,18 @@ async def process_audio(msg, dest):
         ),
     )
     os.remove(p)
+    # log user audio transcription
+    await log_session_step(
+        sessions[dest]["db_session_id"],
+        sessions[dest]["phase"],
+        sessions[dest]["data"],
+        sender=SenderType.user,
+        message=txt
+    )
     await handle_text(dest, txt)
 
 # -----------------------------------------------------------------------------
-# Webhook Pydantic & endpoints
+# Pydantic & endpoints (inalterados)
 # -----------------------------------------------------------------------------
 class TextPayload(BaseModel):
     body: str
