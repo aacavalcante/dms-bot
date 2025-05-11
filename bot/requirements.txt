@@ -1,8 +1,12 @@
 fastapi
-uvicorn
-httpx
-langchain
-openai
+uvicorn[standard]
+pydantic
 python-dotenv
-pydub==0.25.1
-ffmpeg-python==0.2.0
+httpx
+openai
+pydub
+google-api-python-client
+google-auth
+SQLAlchemy
+asyncpg
+aiomysql>=0.1.1  # Alternative to asyncmy
